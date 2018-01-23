@@ -7,11 +7,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import time
 
+timeoutCount = 0.0
+
 #simple point class
 class Point:
-    def __init__ (self, x, y):
+    def __init__ (self, x, y, valid=False):
         self.x = x
         self.y = y
+        self.valid = valid
     def __str__ (self):
         return ("%s %s" % (self.x, self.y))
 
@@ -25,13 +28,7 @@ class AuthInfo:
         self.passwd = passwd
         self.host = host
         self.db = db
-#stores gps coords
-class GPSDat:
-    def __init__ (self, latitude, longitude):
-        self.latitude = latitude
-        self.longitude = longitude
-    def __str__ (self):
-        return ("%s %s " % (self.latitude, self.longitude))
+
 #dataset for bike infos
 class dataSet:
     def __init__( self, idnum, typedat, status, pnum, latitude, longitude, last_act, type_name, bat_level):
@@ -47,7 +44,8 @@ class dataSet:
 
 #Encapsulated POST request, with fills for authorization information
 def getResponse (authInfo, gpsDat):
-
+    global timeoutCount
+    global gpsResults
     response = requests.get(
     'https://web-production.lime.bike/api/rider/v1/views/main',
     params=[                                                                       (                                                                       'mobile_registration_id',
@@ -70,7 +68,21 @@ def getResponse (authInfo, gpsDat):
                                                                            'X-Device-Token': authInfo.xdToken}
 
     )
-    return response
+    json_data = json.loads(response.text)
+    #API timeout error handling
+    if "error_message" in json_data:
+        print("timeout %s" %(timeoutCount))
+        time.sleep(7.5 * timeoutCount)
+        timeoutCount += .15
+        gpsResults.append(Point(gpsDat.x, gpsDat.y, False))
+        return False
+    else:
+        timeoutCount = 1
+        if len(json_data["data"]["attributes"]["nearby_locked_bikes"]) == 0:
+            gpsResults.append(Point(gpsDat.x, gpsDat.y, False))
+        else:
+            gpsResults.append(Point(gpsDat.x, gpsDat.y, True))
+        return json_data
 #Loader function from local stored authentication keys
 def loadAuth( filePath ):
     aifo = AuthInfo
@@ -92,98 +104,128 @@ def loadAuth( filePath ):
         return aifo
 
 #gets raw JSON from response, and pulls bike data structure from it
-def nearbyBikeStrip (response):
-    
-    json_data = json.loads(response.text)
-    print(json_data)
+def nearbyBikeStrip (json_data):
     arr = list()
     if ("data" not in json_data) or (len(json_data["data"]["attributes"]["nearby_locked_bikes"]) == 0):
         return
     for k in json_data["data"]["attributes"]["nearby_locked_bikes"]:
-        
         arr.append(dataSet(k["id"], k["type"], k["attributes"]["status"], k["attributes"]["plate_number"], k["attributes"]["latitude"], k["attributes"]["longitude"], k["attributes"]["last_activity_at"], k["attributes"]["type_name"], k["attributes"]["battery_level"] ))
         
     return arr
 
-        
+def pointPush ( gpsPoints, connData):
+    print("PUSH POINT")
+    x = connData.cursor()
+    insStr = ("INSERT INTO samplePts "
+            " (latitude, longitude, validData )"
+            " VALUES (%s, %s, %s ) ")
+    for p in gpsPoints:
+        try:
+            x.execute(insStr, (p.x, p.y, p.valid))
+        except:
+            connData.rollback()
+            print("FAIL")
+            break
+    connData.commit()
 
-
-def sqlDataPush ( dataSet, batchID, aifo ):
     
+
+
+def sqlDataPush ( dataSet, batchID, connData):
         if dataSet is None or len(dataSet) == 0:
             return
-        conn = MySQLdb.connect(aifo.host, aifo.user, aifo.passwd, aifo.db)
-        print(conn.get_server_info())
-        x = conn.cursor()
+        print("PUSH DATA")
+        x = connData.cursor()
         insStr = ("INSERT INTO bikeData "
             " (superset, id, type, status, platenum, latitude, longitude, last_activity, type_name, battery_level )"
             " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) " )
         for a in dataSet:
             try:
                 x.execute(insStr , (batchID, a.idnum, a.typedat, a.status, a.pnum, a.latitude, a.longitude, a.last_act, a.type_name, a.bat_level))
-                conn.commit()
+                #connData.commit()
             
             except:
-                conn.rollback()
+                connData.rollback()
                 print("FAIL")
                 break
-        conn.close()
+        connData.commit()
 
 def coordGenerate( centerGPS, radius, stepIntervalDist ):
     points = list()
 
     numCircles = radius / stepIntervalDist
-    print(numCircles * 6)
     curAngle = 0
 
 
     ppcircle = 6
     
-
-    for a in range(0, int(numCircles)):
+    oldCirc = 1
+    
+    for a in np.arange(0, numCircles, 1):
         curRadius = (radius / numCircles ) * a
+        curCirc = 2 * math.pi * curRadius
         degPerPt = 360 / ppcircle
-        ppcircle += 2
+        ppcircle *= (curCirc if curCirc != 0 else 1)/oldCirc
+        oldCirc = (curCirc if curCirc != 0 else 1)
+
+        print("%s %s %s %s" %(curRadius, curCirc, ppcircle, degPerPt))
+
         if not a == 0:
-            for v in range(0, ppcircle):
+            for v in np.arange(0, ppcircle, 1):
 
                 x = math.cos(curAngle) * curRadius
                 y = math.sin(curAngle) * curRadius
 
-                p = Point(centerGPS.latitude + x, centerGPS.longitude + y)
+                p = Point(centerGPS.x + x, centerGPS.y + y)
                 points.append(p)
 
                 curAngle += degPerPt
         else:
-            points.append(Point(centerGPS.latitude, centerGPS.longitude))
+            points.append(Point(centerGPS.x, centerGPS.y))
     return points
         
 
 
 
-
+#Entry point.
 def main():
+    global timeoutCount
+    global gpsResults
+    gpsResults = list()
+    timeoutCount = 1
     auth = loadAuth("localAuthDetails")
-    gdat = GPSDat(35.785116,-78.734439)
+    gdat = Point(35.785116,-78.734439)
+    connData = MySQLdb.connect(auth.host, auth.user, auth.passwd, auth.db)
     #
     #
     #
-
-    pts = coordGenerate(gdat, 0.5, 0.2)
+    #Generates the set of sampling points. given starting gps coordinates and a radius, along with a stepping interval
+    pts = coordGenerate(gdat, 3, 0.25)
     x = list()
     y = list()
     cnt = 0
     for a in pts:
-        time.sleep(0.5)
-        response = getResponse(auth, a)
-        dataList = nearbyBikeStrip(response)
-        sqlDataPush(dataList, cnt, auth)
-        print(a)
         x.append(a.x)
         y.append(a.y)
         cnt+=1
+    print("%s points total" %(cnt))
+    total = cnt
+    cnt = 0
     plt.scatter(x, y)
     plt.show()
+    for a in pts:
+        #fastest rate we can sample the API at without becoming locked out.
+        time.sleep(0.75)
+        response = getResponse(auth, a)
+        while response == False:
+            response = getResponse(auth, a)
+        dataList = nearbyBikeStrip(response)
+        sqlDataPush(dataList, cnt, connData)
+        print("%s | %s of %s" % (a, cnt, total))
+        
+        cnt+=1
+    pointPush(gpsResults, connData)
+    
 
 if __name__ == "__main__":
     main()
